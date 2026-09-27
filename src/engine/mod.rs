@@ -9,4 +9,5 @@ pub mod events;
 pub mod input;
 pub mod motion;
 pub mod particles;
+mod render;
 pub mod terminal;

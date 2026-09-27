@@ -16,7 +16,6 @@ use crate::utils::geometry::Coord;
 use crate::utils::graphics::Color;
 use crate::utils::rng::Rng;
 
-const EMPTY_RENDER_CELL: u32 = u32::MAX;
 const NOT_VISIBLE: usize = usize::MAX;
 
 #[derive(Debug, Clone)]
@@ -134,7 +133,7 @@ pub struct Terminal {
     pub outer_fill_characters: Vec<CharId>,
     visible_characters: Vec<CharId>,
     visible_positions: Vec<usize>,
-    render_cells: Vec<u32>,
+    renderer: super::render::Renderer,
     pub terminal_state: Vec<String>,
     output_buffer: String,
     move_cursor_to_top: String,
@@ -241,7 +240,7 @@ impl Terminal {
             outer_fill_characters: Vec::new(),
             visible_characters: Vec::new(),
             visible_positions: vec![NOT_VISIBLE; arena_len],
-            render_cells: Vec::new(),
+            renderer: super::render::Renderer::default(),
             terminal_state: Vec::new(),
             output_buffer: String::new(),
             move_cursor_to_top,
@@ -330,6 +329,7 @@ impl Terminal {
             self.visible_positions[arena_index] = self.visible_characters.len();
             self.visible_characters.push(id);
         } else {
+            self.renderer.remove(arena_index);
             let position = std::mem::replace(&mut self.visible_positions[arena_index], NOT_VISIBLE);
             self.visible_characters.swap_remove(position);
             if position < self.visible_characters.len() {
@@ -509,94 +509,45 @@ impl Terminal {
         }
     }
 
-    /// Paint the visible characters into the reusable cell buffer using the
-    /// canonical (layer, character_id) painter order (plan.md §4.3).
-    fn update_render_cells(&mut self) -> (usize, usize) {
-        let width = self.visible_right.max(0) as usize;
-        let height = self.visible_top.max(0) as usize;
-        let cell_count = width.checked_mul(height).expect("terminal canvas is too large");
-        self.render_cells.resize(cell_count, EMPTY_RENDER_CELL);
-        self.render_cells.fill(EMPTY_RENDER_CELL);
-
-        // The old implementation sorted every visible character by painter
-        // order and overwrote cells in that order.  A cell only needs the
-        // maximum key, so select that winner directly and avoid the per-frame
-        // allocation and O(n log n) sort.
-        for &id in &self.visible_characters {
-            let ch = &self.arena[id.0 as usize];
-            let row = ch.motion.current_coord.row + self.canvas_row_offset;
-            let column = ch.motion.current_coord.column + self.canvas_column_offset;
-            if self.visible_bottom <= row
-                && row <= self.visible_top
-                && self.visible_left <= column
-                && column <= self.visible_right
-            {
-                let cell = &mut self.render_cells[(row - 1) as usize * width + (column - 1) as usize];
-                if *cell == EMPTY_RENDER_CELL {
-                    *cell = id.0;
-                } else {
-                    let painted = &self.arena[*cell as usize];
-                    if (ch.layer, ch.character_id) > (painted.layer, painted.character_id) {
-                        *cell = id.0;
-                    }
-                }
-            }
-        }
-
-        (width, height)
+    fn update_render_cells(&mut self) {
+        self.renderer.update(
+            &self.arena,
+            &self.visible_characters,
+            [
+                self.visible_left,
+                self.visible_right,
+                self.visible_bottom,
+                self.visible_top,
+                self.canvas_column_offset,
+                self.canvas_row_offset,
+            ],
+        );
     }
 
-    /// Terminal._update_terminal_state: materialize the row-oriented state
-    /// exposed by the upstream API. Frame output uses the cell buffer directly
-    /// so the hot path does not copy every rendered byte through these rows.
+    /// Materialize the bottom-up row state exposed by the upstream API.
     pub fn update_terminal_state(&mut self) {
-        let (width, height) = self.update_render_cells();
-
-        self.terminal_state.resize_with(height, String::new);
-        self.terminal_state.truncate(height);
-        let arena = &self.arena;
-        for (row_index, row) in self.terminal_state.iter_mut().enumerate() {
-            row.clear();
-            if row.capacity() < width {
-                row.reserve(width);
-            }
-            for &cell in &self.render_cells[row_index * width..(row_index + 1) * width] {
-                if cell == EMPTY_RENDER_CELL {
-                    row.push(' ');
-                } else {
-                    row.push_str(arena[cell as usize].animation.current_character_visual.formatted_symbol.as_str());
-                }
-            }
+        self.update_render_cells();
+        self.terminal_state.resize_with(self.renderer.rows().len(), String::new);
+        for (output, row) in self.terminal_state.iter_mut().zip(self.renderer.rows()) {
+            output.clear();
+            output.push_str(row);
         }
     }
 
-    /// get_formatted_output_string: refresh + emit top row first.
+    /// Refresh changed cells and blocks, then emit cached rows top first.
     pub fn get_formatted_output_string(&mut self) -> String {
-        let (width, height) = self.update_render_cells();
-        let minimum_capacity = width
-            .checked_mul(height)
-            .and_then(|cells| cells.checked_add(height.saturating_sub(1)))
-            .expect("terminal canvas is too large");
-        let mut out = std::mem::take(&mut self.output_buffer).into_bytes();
+        self.update_render_cells();
+        let mut out = std::mem::take(&mut self.output_buffer);
         out.clear();
-        if out.capacity() < minimum_capacity {
-            out.reserve(minimum_capacity);
+        let mut rows = self.renderer.rows().rev();
+        if let Some(row) = rows.next() {
+            out.push_str(row);
         }
-        let arena = &self.arena;
-        for row_index in (0..height).rev() {
-            if row_index + 1 < height {
-                out.push(b'\n');
-            }
-            for &cell in &self.render_cells[row_index * width..(row_index + 1) * width] {
-                if cell == EMPTY_RENDER_CELL {
-                    out.push(b' ');
-                } else {
-                    arena[cell as usize].animation.current_character_visual.formatted_symbol.append_to(&mut out);
-                }
-            }
+        for row in rows {
+            out.push('\n');
+            out.push_str(row);
         }
-        // SAFETY: every appended run is a whole formatted symbol, which is UTF-8.
-        unsafe { String::from_utf8_unchecked(out) }
+        out
     }
 
     pub(crate) fn recycle_output_string(&mut self, mut output: String) {
